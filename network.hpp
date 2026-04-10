@@ -12,9 +12,9 @@
 
 /*
   TODO:
-  - enable disabling optimizer
   - enable returning input error for CPU
   - more efficient softmax
+  - clone method
   - write CPU based counterpart
   - write documentation
 */
@@ -30,9 +30,9 @@ public:
     Softmax
   };
   
-  Network(const std::vector<int>& neuronsInLayers, Activation hiddenActivationFunction, Activation outputActivationFunction, float learningRate, bool fastMath = true, bool printDeviceInfo = false, int usedDeviceIndex = 0);
-  Network(const std::vector<int>& neuronsInLayers, const std::vector<Activation>& activationFunctions, float learningRate, bool fastMath = true, bool printDeviceInfo = false, int usedDeviceIndex = 0);
-  Network(const std::string& path, bool fastMath = true, bool printDeviceInfo = false, int usedDeviceIndex = 0);
+  Network(const std::vector<int>& neuronsInLayers, Activation hiddenActivationFunction, Activation outputActivationFunction, float learningRate, bool fastMath = true, bool optimizer = true, bool printDeviceInfo = false, int usedDeviceIndex = 0);
+  Network(const std::vector<int>& neuronsInLayers, const std::vector<Activation>& activationFunctions, float learningRate, bool fastMath = true, bool optimizer = true, bool printDeviceInfo = false, int usedDeviceIndex = 0);
+  Network(const std::string& path, bool fastMath = true, bool optimizer = true, bool printDeviceInfo = false, int usedDeviceIndex = 0);
   ~Network();
 
   void setLearningRate(float l);
@@ -40,12 +40,14 @@ public:
   void setBETA2(float b);
   void setEpsilon(float e);
   void setWeightDecay(float w);
+  void setOptimizerEnabled(bool o);
 
   float getLearningRate();
   float getBETA1();
   float getBETA2();
   float getEpsilon();
   float getWeightDecay();
+  bool getOptimizerEnabled();
 
   void setDropoutRate(std::vector<float> rates);
   std::vector<float> getDropoutRates();
@@ -143,7 +145,7 @@ private:
   std::vector<cl_program> programs;
 
   float learningRate;
-
+  bool useOptimizer;
   int networkInputs;
   
   cl_context context = nullptr;
@@ -157,6 +159,8 @@ private:
 
   cl_kernel averageNetworkUpdateBiasKernel = nullptr;
   cl_kernel averageNetworkUpdateWeightKernel = nullptr;
+  cl_kernel averageNetworkUpdateBiasKernelNoOptimizer = nullptr;
+  cl_kernel averageNetworkUpdateWeightKernelNoOptimizer = nullptr;
   cl_kernel softMaxKernel = nullptr;
   cl_kernel copyProbsToActivationKernel = nullptr;
   
