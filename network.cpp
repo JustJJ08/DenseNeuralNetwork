@@ -162,10 +162,23 @@ float vHat = expAvgSqW[idx] / pcBeta2PowT;
 weights[idx] -= learningRate * (mHat / (sqrt(vHat) + EPSILON));
 weights[idx] -= learningRate * WEIGHT_DECAY * weights[idx];
 }
+
+__kernel void average_deltas_and_update_network_biases_no_optimizer(__global const float* biasGradients, __global float* biases, float learningRate) {
+int neuron = get_global_id(0);
+biases[neuron] -= learningRate * biasGradients[neuron];
+}
+
+__kernel void average_deltas_and_update_network_weights_no_optimizer(__global const float* weightGradients, __global float* weights, float learningRate) {
+int neuron = get_global_id(0);
+int previous = get_global_id(1);
+int idx = neuron * get_global_size(1) + previous;
+weights[idx] -= learningRate * weightGradients[idx];
+}
 )CLC";
 
-Network::Network(const std::vector<int>& neuronsInLayers, Activation hiddenActivationFunction, Activation outputActivationFunction, float learningRate, bool fastMath, bool printDeviceInfo, int usedDeviceIndex) {
+Network::Network(const std::vector<int>& neuronsInLayers, Activation hiddenActivationFunction, Activation outputActivationFunction, float learningRate, bool fastMath, bool optimizer, bool printDeviceInfo, int usedDeviceIndex) {
   this -> learningRate = learningRate;
+  useOptimizer = optimizer;
 
   if (neuronsInLayers.size() < 2) throw std::invalid_argument("You can't create a network with only one layer");
 
@@ -214,8 +227,9 @@ Network::Network(const std::vector<int>& neuronsInLayers, Activation hiddenActiv
   networkInputs = neuronsInLayers[0];
 }
 
-Network::Network(const std::vector<int>& neuronsInLayers, const std::vector<Activation>& activationFunctions, float learningRate, bool fastMath, bool printDeviceInfo, int usedDeviceIndex) {
+Network::Network(const std::vector<int>& neuronsInLayers, const std::vector<Activation>& activationFunctions, float learningRate, bool fastMath, bool optimizer, bool printDeviceInfo, int usedDeviceIndex) {
   this -> learningRate = learningRate;
+  useOptimizer = optimizer;
 
   if (neuronsInLayers.size() < 2) throw std::invalid_argument("You can't create a network with only one layer");
   if (activationFunctions.size() != neuronsInLayers.size() - 1) throw std::invalid_argument("You need to specify an activation function for each layer in your network except the input layer.\n  Provided functions: " + std::to_string(activationFunctions.size()) + "\n  Expected functions: " + std::to_string(neuronsInLayers.size() - 1));
@@ -262,7 +276,9 @@ Network::Network(const std::vector<int>& neuronsInLayers, const std::vector<Acti
   networkInputs = neuronsInLayers[0];
 }
 
-Network::Network(const std::string& path, bool fastMath, bool printDeviceInfo, int usedDeviceIndex) {  
+Network::Network(const std::string& path, bool fastMath, bool optimizer, bool printDeviceInfo, int usedDeviceIndex) {
+  useOptimizer = optimizer;
+  
   device = getDevice(printDeviceInfo, usedDeviceIndex);
   context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
   clCheckErr(err, "clCreateContext");
@@ -339,12 +355,14 @@ void Network::setBETA1(float b) { BETA1 = b; }
 void Network::setBETA2(float b) { BETA2 = b; }
 void Network::setEpsilon(float e) { EPSILON = e; }
 void Network::setWeightDecay(float w) { WEIGHT_DECAY = w; }
+void Network::setOptimizerEnabled(bool o) { useOptimizer = o; }
 
 float Network::getLearningRate() { return learningRate; }
 float Network::getBETA1() { return BETA1; }
 float Network::getBETA2() { return BETA2; }
 float Network::getEpsilon() { return EPSILON; }
 float Network::getWeightDecay() { return WEIGHT_DECAY; }
+bool Network::getOptimizerEnabled() { return useOptimizer; }
 
 void Network::setDropoutRate(std::vector<float> rates) {
   if (rates.size() != layers.size() - 1)
@@ -552,6 +570,10 @@ void Network::createKernels() {
   clCheckErr(err, "Creation of Kernel \"averageNetworkUpdateBiasKernel\"");
   averageNetworkUpdateWeightKernel = clCreateKernel(programs.back(), "average_deltas_and_update_network_weights", &err);
   clCheckErr(err, "Creation of Kernel \"averageNetworkUpdateWeightKernel\"");
+  averageNetworkUpdateBiasKernelNoOptimizer = clCreateKernel(programs.back(), "average_deltas_and_update_network_biases_no_optimizer", &err);
+  clCheckErr(err, "Creation of Kernel \"averageNetworkUpdateBiasKernelNoOptimizer\"");
+  averageNetworkUpdateWeightKernelNoOptimizer = clCreateKernel(programs.back(), "average_deltas_and_update_network_weights_no_optimizer", &err);
+  clCheckErr(err, "Creation of Kernel \"averageNetworkUpdateWeightKernelNoOptimizer\"");
   softMaxKernel = clCreateKernel(programs.back(), "softmax", &err);
   clCheckErr(err, "Creation of Kernel \"softMaxKernel\"");
   copyProbsToActivationKernel = clCreateKernel(programs.back(), "copy_softmax_to_activations", &err);
@@ -1099,26 +1121,33 @@ void Network::updateNetwork() {
   float pcBeta2PowT = 1.0f - beta2PowT;
 
   float invBatch = 1.0f / (float) lastTrainBatchSize;
-  
-  err = clSetKernelArg(averageNetworkUpdateBiasKernel, 4, sizeof(float), &learningRate);
-  err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 5, sizeof(float), &BETA1);
-  err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 6, sizeof(float), &BETA2);
-  err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 7, sizeof(float), &pcBETA1);
-  err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 8, sizeof(float), &pcBETA2);
-  err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 9, sizeof(float), &pcBeta1PowT);
-  err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 10, sizeof(float), &pcBeta2PowT);
-  err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 11, sizeof(float), &EPSILON);
+
+  cl_kernel kb = useOptimizer ? averageNetworkUpdateBiasKernel : averageNetworkUpdateBiasKernelNoOptimizer;
+  cl_kernel kw = useOptimizer ? averageNetworkUpdateWeightKernel : averageNetworkUpdateWeightKernelNoOptimizer;
+ 
+  err = clSetKernelArg(kb, useOptimizer ? 4 : 2, sizeof(float), &learningRate);
+  if (useOptimizer) {
+    err |= clSetKernelArg(kb, 5, sizeof(float), &BETA1);
+    err |= clSetKernelArg(kb, 6, sizeof(float), &BETA2);
+    err |= clSetKernelArg(kb, 7, sizeof(float), &pcBETA1);
+    err |= clSetKernelArg(kb, 8, sizeof(float), &pcBETA2);
+    err |= clSetKernelArg(kb, 9, sizeof(float), &pcBeta1PowT);
+    err |= clSetKernelArg(kb, 10, sizeof(float), &pcBeta2PowT);
+    err |= clSetKernelArg(kb, 11, sizeof(float), &EPSILON);
+  }
   clCheckErr(err, "Setting kernel arguments: \"averageNetworkUpdateBiasKernel\"");
   
-  err = clSetKernelArg(averageNetworkUpdateWeightKernel, 4, sizeof(float), &learningRate);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 5, sizeof(float), &BETA1);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 6, sizeof(float), &BETA2);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 7, sizeof(float), &pcBETA1);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 8, sizeof(float), &pcBETA2);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 9, sizeof(float), &pcBeta1PowT);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 10, sizeof(float), &pcBeta2PowT);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 11, sizeof(float), &EPSILON);
-  err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 12, sizeof(float), &WEIGHT_DECAY);
+  err = clSetKernelArg(kw, useOptimizer ? 4 : 2, sizeof(float), &learningRate);
+  if (useOptimizer) {
+    err |= clSetKernelArg(kw, 5, sizeof(float), &BETA1);
+    err |= clSetKernelArg(kw, 6, sizeof(float), &BETA2);
+    err |= clSetKernelArg(kw, 7, sizeof(float), &pcBETA1);
+    err |= clSetKernelArg(kw, 8, sizeof(float), &pcBETA2);
+    err |= clSetKernelArg(kw, 9, sizeof(float), &pcBeta1PowT);
+    err |= clSetKernelArg(kw, 10, sizeof(float), &pcBeta2PowT);
+    err |= clSetKernelArg(kw, 11, sizeof(float), &EPSILON);
+    err |= clSetKernelArg(kw, 12, sizeof(float), &WEIGHT_DECAY);
+  }
   clCheckErr(err, "Setting kernel arguments: \"averageNetworkUpdateWeightKernel\"");
 
   for (int x = 0; x < layers.size(); x++) {
@@ -1148,27 +1177,31 @@ void Network::updateNetwork() {
 
     if (status != clblast::StatusCode::kSuccess) throw std::runtime_error("GEMM error: " + std::to_string(static_cast<int>(status)));
 
-    err = clSetKernelArg(averageNetworkUpdateBiasKernel, 0, sizeof(cl_mem), &biasGradientBuffer[x]);
-    err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 1, sizeof(cl_mem), &layers[x].biasesBuffer);
-    err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 2, sizeof(cl_mem), &layers[x].expAvgB);
-    err |= clSetKernelArg(averageNetworkUpdateBiasKernel, 3, sizeof(cl_mem), &layers[x].expAvgSqB);
+    err = clSetKernelArg(kb, 0, sizeof(cl_mem), &biasGradientBuffer[x]);
+    err |= clSetKernelArg(kb, 1, sizeof(cl_mem), &layers[x].biasesBuffer);
+    if (useOptimizer) {
+      err |= clSetKernelArg(kb, 2, sizeof(cl_mem), &layers[x].expAvgB);
+      err |= clSetKernelArg(kb, 3, sizeof(cl_mem), &layers[x].expAvgSqB);
+    }
     clCheckErr(err, "Setting kernel arguments: \"averageNetworkUpdateBiasKernel\"");
 
     {
       size_t globalSize = (size_t) neurons;
-      err = clEnqueueNDRangeKernel(queue, averageNetworkUpdateBiasKernel, 1, nullptr, &globalSize, nullptr, 0, nullptr, nullptr);
+      err = clEnqueueNDRangeKernel(queue, kb, 1, nullptr, &globalSize, nullptr, 0, nullptr, nullptr);
       clCheckErr(err, "Launching kernel \"averageNetworkUpdateBiasKernel\"");
     }
     
-    err = clSetKernelArg(averageNetworkUpdateWeightKernel, 0, sizeof(cl_mem), &weightGradientBuffer[x]);
-    err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 1, sizeof(cl_mem), &layers[x].weightsBuffer);
-    err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 2, sizeof(cl_mem), &layers[x].expAvgW);
-    err |= clSetKernelArg(averageNetworkUpdateWeightKernel, 3, sizeof(cl_mem), &layers[x].expAvgSqW);
+    err = clSetKernelArg(kw, 0, sizeof(cl_mem), &weightGradientBuffer[x]);
+    err |= clSetKernelArg(kw, 1, sizeof(cl_mem), &layers[x].weightsBuffer);
+    if (useOptimizer) {
+      err |= clSetKernelArg(kw, 2, sizeof(cl_mem), &layers[x].expAvgW);
+      err |= clSetKernelArg(kw, 3, sizeof(cl_mem), &layers[x].expAvgSqW);
+    }
     clCheckErr(err, "Setting kernel arguments: \"averageNetworkUpdateWeightKernel\"");
 
     {
       size_t globalSize[2] = { (size_t) neurons, (size_t) previousNeurons };
-      err = clEnqueueNDRangeKernel(queue, averageNetworkUpdateWeightKernel, 2, nullptr, globalSize, nullptr, 0, nullptr, nullptr);
+      err = clEnqueueNDRangeKernel(queue, kw, 2, nullptr, globalSize, nullptr, 0, nullptr, nullptr);
       clCheckErr(err, "Launching kernel \"averageNetworkUpdateWeightKernel\"");
     }
   }
